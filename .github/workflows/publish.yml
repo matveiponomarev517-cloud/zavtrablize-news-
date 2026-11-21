@@ -1,1 +1,51 @@
+name: Zavtra Blizhe News
 
+on:
+  schedule:
+    - cron: '7 * * * *'   # раз в час; бот сам соблюдает окно 8-23 МСК и паузу между постами
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zavtrablize-news
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run editor
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+        run: python newsbot.py
+      - name: Save database
+        if: always()
+        run: |
+          if [ -f news.db ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add news.db
+            if ! git diff --cached --quiet; then
+              git commit -m "Update news database"
+              # Если база не сохранится, следующий запуск может повторить пост — поэтому 3 попытки.
+              for i in 1 2 3; do
+                git push && exit 0
+                sleep 5
+                git pull --rebase -X theirs || true
+              done
+              echo "::error::Не удалось сохранить news.db"
+              exit 1
+            fi
+          fi
