@@ -469,4 +469,606 @@ def set_status(c, uid, status, error=None, post=None):
 def blocked_reason(c, now, manual):
     """Почему сейчас нельзя публиковать (None = можно). Ручной запуск обходит окно и паузу."""
     day_start = (
-        datetim
+        datetime.datetime.combine(now.astimezone(MSK).date(), datetime.time(0), tzinfo=MSK)
+        .astimezone(datetime.timezone.utc)
+        .isoformat()
+    )
+    n = c.execute(
+        "SELECT COUNT(*) FROM articles WHERE status='published' AND created>=?", (day_start,)
+    ).fetchone()[0]
+    if n >= MAX_DAY:
+        return f"дневной лимит ({n}/{MAX_DAY})"
+    if manual:
+        return None
+    if not HOUR_FROM <= now.astimezone(MSK).hour < HOUR_TO:
+        return f"вне окна публикаций {HOUR_FROM}-{HOUR_TO} МСК"
+    last = c.execute("SELECT MAX(created) FROM articles WHERE status='published'").fetchone()[0]
+    if last:
+        gap = now - datetime.datetime.fromisoformat(last)
+        if gap < datetime.timedelta(minutes=MIN_GAP_MIN):
+            return f"пауза между постами ({int(gap.total_seconds() // 60)}/{MIN_GAP_MIN} мин)"
+    return None
+
+
+def bump(c, key, n=1):
+    c.execute(
+        "INSERT INTO meta(k, v) VALUES (?, ?) "
+        "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + ? AS TEXT)", (key, str(n), n)
+    )
+    c.commit()
+
+
+def monthly_report(c, now):
+    """Раз в месяц (1-5 числа) присылает админу отчёт за прошлый месяц."""
+    admin = env("TELEGRAM_ADMIN_ID")
+    local = now.astimezone(MSK)
+    if not admin or local.day > 5 or local.hour < 10:
+        return
+    this_start = local.date().replace(day=1)
+    prev_start = (this_start - datetime.timedelta(days=1)).replace(day=1)
+    ym = prev_start.strftime("%Y-%m")
+    if c.execute("SELECT 1 FROM meta WHERE k=?", ("report:" + ym,)).fetchone():
+        return
+
+    def utc(d):
+        return datetime.datetime.combine(d, datetime.time(0), tzinfo=MSK).astimezone(
+            datetime.timezone.utc).isoformat()
+
+    rows = c.execute(
+        "SELECT url, topic, status, error FROM articles WHERE created>=? AND created<?",
+        (utc(prev_start), utc(this_start)),
+    ).fetchall()
+    kinds, topics, domains, covers = Counter(), Counter(), Counter(), Counter()
+    published = rejected = errors = 0
+    for url, topic, status, err in rows:
+        if status == "published":
+            published += 1
+            m = re.search(r"kind=(\w+)", err or "")
+            kinds[m.group(1) if m else ("digest" if url.startswith("digest:") else "news")] += 1
+            if topic and topic != "history":
+                topics[topic] += 1
+            if not url.startswith(("digest:", "history:")):
+                domains[urllib.parse.urlsplit(url).netloc.replace("www.", "")] += 1
+            m = re.search(r"cover=(\w+)", err or "")
+            covers[m.group(1) if m else "none"] += 1
+        elif status == "rejected":
+            rejected += 1
+        elif status == "error":
+            errors += 1
+
+    runs = int((c.execute("SELECT v FROM meta WHERE k=?", ("runs:" + ym,)).fetchone() or ["0"])[0])
+    scouts = (c.execute("SELECT v FROM meta WHERE k=?", ("scout:" + ym,)).fetchone() or ["0"])[0]
+    bad = []
+    for k, v in c.execute("SELECT k, v FROM meta WHERE k LIKE ?", (f"ff:{ym}:%",)):
+        if runs and int(v) * 2 >= runs:
+            bad.append(f"{k.split(':', 2)[2]} ({v} из {runs})")
+
+    def fmt(counter, n=6):
+        return ", ".join(f"{k} {v}" for k, v in counter.most_common(n)) or "—"
+
+    days = (this_start - prev_start).days
+    text = (
+        f"📊 «Завтра ближе» — итоги {ym}\n\n"
+        f"Публикаций: {published} (≈ {published / days:.1f} в день)\n"
+        f"Форматы: {fmt(kinds)}\n"
+        f"Темы: {fmt(topics)}\n"
+        f"Источники: {fmt(domains, 8)}\n"
+        f"Обложки: ИИ {covers['ai']}, градиент {covers['grad']}, без картинки {covers['none']}"
+        f" (ИИ ≈ ${covers['ai'] * 0.04:.2f})\n"
+        f"Отклонено фильтром: {rejected}, ошибок: {errors}\n"
+        f"Поисков Gemini по интернету: {scouts}\n"
+        + ("Ленты, которые часто не загружались (можно удалить): " + "; ".join(bad) if bad else
+           "Все RSS-ленты работали стабильно.")
+    )
+    tg(text[:3900], chat_id=admin)
+    c.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", ("report:" + ym, now.isoformat()))
+    c.commit()
+    log.info("Месячный отчёт за %s отправлен", ym)
+
+
+def check_silence(c, now):
+    """Если давно ничего не выходило — один раз в сутки предупреждаем админа."""
+    last = c.execute("SELECT MAX(created) FROM articles WHERE status='published'").fetchone()[0]
+    if not last:
+        return
+    if now - datetime.datetime.fromisoformat(last) < datetime.timedelta(hours=SILENCE_HOURS):
+        return
+    row = c.execute("SELECT v FROM meta WHERE k='silence_alert'").fetchone()
+    if row and now - datetime.datetime.fromisoformat(row[0]) < datetime.timedelta(hours=24):
+        return
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('silence_alert', ?)", (now.isoformat(),))
+    c.commit()
+    alert(f"⚠️ «Завтра ближе»: нет публикаций больше {SILENCE_HOURS} ч. Проверьте логи в Actions.")
+
+
+# ---------- RSS ----------
+
+def clean(text):
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    return " ".join(text.split())[:2000]
+
+
+def fetch_feed(url):
+    f = feedparser.parse(
+        req(url, headers={"Accept": "application/rss+xml, application/xml, text/xml, */*"},
+            retries=0, timeout=20)
+    )
+    if not f.entries:
+        raise RuntimeError(f"в ленте нет записей ({getattr(f, 'bozo_exception', '')})")
+    return f.entries[:15]
+
+
+def collect(c, now):
+    found, failed = {}, []
+    for feed, is_open, topic in RSS:
+        try:
+            entries = fetch_feed(feed)
+        except Exception as ex:
+            log.warning("RSS %s: %s", feed, scrub(ex))
+            failed.append(feed)
+            continue
+
+        for e in entries:
+            url = (e.get("link") or "").strip()
+            title = " ".join((e.get("title") or "").split())
+            if not url or not title:
+                continue
+            uid = digest(url)
+            if uid in found:
+                continue
+
+            if seen(c, uid, title):
+                continue
+
+            stamp = e.get("published_parsed") or e.get("updated_parsed")
+            age = 0
+            if stamp:
+                dt = datetime.datetime(*stamp[:6], tzinfo=datetime.timezone.utc)
+                if (now - dt).days > 14 or dt > now + datetime.timedelta(hours=1):
+                    continue
+                age = dt.timestamp()
+            found[uid] = (age, uid, url, title, clean(e.get("summary")), is_open, topic, "", False)
+
+    ym = now.astimezone(MSK).strftime("%Y-%m")
+    bump(c, f"runs:{ym}")
+    for feed in failed:
+        bump(c, f"ff:{ym}:{feed}")
+    if len(failed) == len(RSS):
+        raise RuntimeError("Не загрузилась ни одна RSS-лента")
+    return list(found.values())
+
+
+def seen(c, uid, title):
+    """Уже публиковали/отклоняли, зависло на отправке или исчерпаны попытки."""
+    row = c.execute("SELECT status, attempts FROM articles WHERE id=?", (uid,)).fetchone()
+    if row and (row[0] in ("published", "rejected", "sending") or (row[1] or 0) >= MAX_ATTEMPTS):
+        return True
+    return bool(c.execute(
+        "SELECT 1 FROM articles WHERE title=? AND id<>? AND status IN ('published','rejected','sending')",
+        (title, uid),
+    ).fetchone())
+
+
+def order(c, found, prefer_web):
+    """Разнообразие: чередуем RSS и поиск; затем сайты и темы, которых меньше всего среди
+    последних 10 постов; внутри — самые свежие."""
+    rows = c.execute(
+        "SELECT url, topic FROM articles WHERE status='published' AND url NOT LIKE 'digest:%' "
+        "AND url NOT LIKE 'history:%' ORDER BY created DESC LIMIT 10"
+    ).fetchall()
+    doms = Counter(urllib.parse.urlsplit(u).netloc for u, _ in rows)
+    tops = Counter(t for _, t in rows if t)
+
+    def rank(x):
+        mix = doms[urllib.parse.urlsplit(x[2]).netloc] + tops[x[6]]
+        return (x[8] != prefer_web, mix, -x[0])
+
+    return sorted(found, key=rank)
+
+
+# ---------- поиск новостей по всему интернету (Gemini + Google Search) ----------
+
+# (тема для поиска, тег для баланса тем)
+TOPICS = [
+    ("space and astronomy", "space"),
+    ("artificial intelligence and robotics", "tech"),
+    ("medicine and biotechnology", "health"),
+    ("physics and materials science", "science"),
+    ("climate, energy and environment", "environment"),
+    ("biology, evolution and paleontology", "science"),
+    ("engineering and new technology", "tech"),
+    ("neuroscience and psychology", "health"),
+    ("mathematics and computer science", "science"),
+]
+BLOCKED_HOSTS = ("google.", "youtube.", "youtu.be", "facebook.", "twitter.", "x.com", "instagram.",
+                 "tiktok.", "vertexaisearch", "linkedin.", "pinterest.")
+BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+
+
+def safe_url(url):
+    p = urllib.parse.urlsplit(url)
+    host = (p.hostname or "").lower()
+    if p.scheme not in ("http", "https") or not host or host == "localhost":
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False            # IP-адреса не открываем
+    except ValueError:
+        return True
+
+
+def fetch_html(url):
+    r = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept": "text/html"})
+    with urllib.request.urlopen(r, timeout=20) as x:
+        if "html" not in (x.headers.get("Content-Type") or ""):
+            raise RuntimeError("не HTML")
+        charset = x.headers.get_content_charset() or "utf-8"
+        return x.geturl(), x.read(2_000_000).decode(charset, "replace")
+
+
+def scout(models, topic, now):
+    """Gemini с поиском Google находит свежие новости по теме. Возвращает [{title,url,summary}]."""
+    prompt = (
+        f"Today is {now:%Y-%m-%d}. Use Google Search to find 6 significant science or technology news "
+        f"stories about {topic} published in the last 3 days, from DIFFERENT reputable sources "
+        "(universities, journals, space agencies, research institutes, quality science media). "
+        "Give direct links to the articles, not home pages or aggregators. Return ONLY a JSON array "
+        'of objects {"title": original headline, "url": link, "summary": 1-2 sentences}.'
+    )
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 4096},
+    }).encode()
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY}
+    last = None
+    for model in models[:2]:
+        try:
+            d = json.loads(req(f"{GEMINI_URL}models/{model}:generateContent", body, headers, timeout=120))
+            parts = ((d.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts)
+            a, b = text.find("["), text.rfind("]")
+            items = json.loads(text[a:b + 1]) if 0 <= a < b else []
+            return [i for i in items if isinstance(i, dict)]
+        except (RuntimeError, ValueError) as ex:
+            last = f"{model}: {scrub(ex)}"
+    raise RuntimeError("Поиск Gemini: " + str(last))
+
+
+def web_candidates(c, models, now, published_total):
+    """Новости из поиска. Каждую ссылку открываем сами и пишем пост по реальному тексту страницы."""
+    import trafilatura
+    topic, tag = TOPICS[published_total % len(TOPICS)]
+    bump(c, "scout:" + now.astimezone(MSK).strftime("%Y-%m"))
+    out = []
+    for it in scout(models, topic, now)[:8]:
+        url = str(it.get("url") or "").strip()
+        if not safe_url(url):
+            continue
+        try:
+            final, page = fetch_html(url)
+        except Exception as ex:
+            log.info("Поиск: ссылка недоступна %s (%s)", urllib.parse.urlsplit(url).netloc, ex)
+            continue
+        host = urllib.parse.urlsplit(final).netloc.lower()
+        if not safe_url(final) or any(b in host for b in BLOCKED_HOSTS):
+            continue
+        text = trafilatura.extract(page, include_comments=False, favor_precision=True) or ""
+        if len(text) < 800:
+            continue
+        meta = trafilatura.extract_metadata(page)
+        age = 0
+        date = getattr(meta, "date", None)
+        if date:
+            try:
+                dt = datetime.datetime.fromisoformat(date[:10]).replace(tzinfo=datetime.timezone.utc)
+                if (now - dt).days > 10:
+                    continue
+                age = dt.timestamp()
+            except ValueError:
+                pass
+        title = " ".join((getattr(meta, "title", None) or it.get("title") or "").split())[:200]
+        uid = digest(final)
+        if not title or seen(c, uid, title):
+            continue
+        out.append((age, uid, final, title, clean(it.get("summary")), False, tag, text[:6000], True))
+    log.info("Поиск (%s): найдено и проверено %d", topic, len(out))
+    return out
+
+
+def fetch_history(now):
+    """События этого дня из Википедии, отфильтрованные по научной тематике."""
+    d = now.astimezone(MSK)
+    raw = req(
+        f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/{d.month:02d}/{d.day:02d}",
+        retries=1, timeout=20,
+    )
+    out = []
+    for e in json.loads(raw).get("events", []):
+        text = " ".join((e.get("text") or "").split())
+        pages = e.get("pages") or []
+        url = ((pages[0].get("content_urls") or {}).get("desktop") or {}).get("page") if pages else None
+        if url and text and SCI_RE.search(text):
+            out.append((e.get("year"), text, url))
+    return out[:15]
+
+
+def run_history(c, now, models, names, recent):
+    """Пост «Сегодня в истории науки». True, если опубликовано; иначе вернёт False без ошибки."""
+    key = "history:" + now.astimezone(MSK).date().isoformat()
+    row = c.execute("SELECT status, attempts FROM articles WHERE url=?", (key,)).fetchone()
+    if row and (row[0] in ("published", "rejected", "sending") or (row[1] or 0) >= MAX_ATTEMPTS):
+        return False
+    uid = digest(key)
+    try:
+        events = fetch_history(now)
+        if not events:
+            log.info("История: научных событий на сегодня не нашлось")
+            return False
+        c.execute(
+            "INSERT OR IGNORE INTO articles (id,url,title,status,created,attempts,topic) "
+            "VALUES (?,?,?,?,?,0,'history')", (uid, key, "В истории науки " + key[8:], "processing", now.isoformat()),
+        )
+        c.execute(
+            "UPDATE articles SET status='processing', created=?, attempts=COALESCE(attempts,0)+1 "
+            "WHERE id=?", (now.isoformat(), uid),
+        )
+        c.commit()
+        listing = "\n".join(f"{i}. [{y}] {t}" for i, (y, t, _) in enumerate(events))
+        parts = [COMMON_RULES, KIND_RULES["history"]]
+        if recent:
+            parts.append("Недавние публикации (не повторять): " + "; ".join(recent))
+        parts.append("<data>\n" + listing + "\n</data>")
+        res = gemini_json(models, "\n\n".join(parts))
+
+        idx = res.get("source_index")
+        post = str(res.get("post") or "").strip()
+        if res.get("publish") is not True or not isinstance(idx, int) or not 0 <= idx < len(events):
+            set_status(c, uid, "rejected", str(res.get("reason") or "no event")[:500])
+            return False
+        url = events[idx][2]
+        if len(post) < 200 or c.execute(
+            "SELECT 1 FROM articles WHERE status='published' AND error LIKE ?", (f"%{url}%",)
+        ).fetchone():
+            set_status(c, uid, "rejected", "короткий пост или событие уже было")
+            return False
+
+        post = with_source(post, url)
+        photo, cov = make_cover(res, "history", uid, names, c, now)
+        set_status(c, uid, "sending", post=post)
+        mid = deliver(photo, post)
+        set_status(c, uid, "published", f"kind=history;cover={cov};url={url};telegram_message_id={mid}")
+        log.info("Опубликовано (history): %s", events[idx][1][:80])
+        return True
+    except Exception as ex:
+        set_status(c, uid, "error", scrub(ex)[:1000])
+        log.error("История не опубликована: %s", scrub(ex))
+        return False
+
+
+def fetch_body(url):
+    """Полный текст страницы для лонгрида ('' если не удалось)."""
+    try:
+        import trafilatura
+        page = req(url, headers={"Accept": "text/html"}, retries=1).decode("utf-8", "replace")
+        return (trafilatura.extract(page, include_comments=False, favor_precision=True) or "")[:8000]
+    except Exception as ex:
+        log.warning("Не удалось получить текст страницы: %s", scrub(ex))
+        return ""
+
+
+def with_source(post, url):
+    if url in post:
+        if len(post) > 4096:
+            raise ValueError("Пост длиннее лимита Telegram")
+        return post
+    tail = "\n\nИсточник: " + url
+    return post[: 4000 - len(tail)].rstrip() + tail
+
+
+def fit_article(article, url):
+    tail = "\n\nИсточник: " + url
+    limit = 4096 - len(tail)
+    if len(article) > limit:
+        cut = article[:limit]
+        article = cut[: cut.rfind("\n\n")] if "\n\n" in cut else cut.rstrip()
+    return article + tail
+
+
+# ---------- сценарии ----------
+
+def recent_titles(c, n=8):
+    return [r[0][:90] for r in c.execute(
+        "SELECT title FROM articles WHERE status='published' AND url NOT LIKE 'digest:%' "
+        "ORDER BY created DESC LIMIT ?", (n,))]
+
+
+def digest_due(c, now, manual):
+    local = now.astimezone(MSK)
+    if manual or local.weekday() != DIGEST_DAY or local.hour < DIGEST_HOUR:
+        return None
+    key = "digest:%d-W%02d" % local.isocalendar()[:2]
+    if c.execute(
+        "SELECT 1 FROM articles WHERE url=? AND status IN ('published','rejected','sending')", (key,)
+    ).fetchone():
+        return None
+    return key
+
+
+def run_digest(c, now, key, models, names):
+    week_ago = (now - datetime.timedelta(days=7)).isoformat()
+    items = []
+    for (post,) in c.execute(
+        "SELECT post FROM articles WHERE status='published' AND url NOT LIKE 'digest:%' "
+        "AND created>=? ORDER BY created", (week_ago,)
+    ):
+        first = (post or "").strip().split("\n")[0][:120]
+        if first:
+            items.append(first)
+    uid = digest(key)
+    c.execute(
+        "INSERT OR IGNORE INTO articles (id,url,title,status,created,attempts) VALUES (?,?,?,?,?,1)",
+        (uid, key, "Итоги недели " + key[7:], "processing", now.isoformat()),
+    )
+    c.commit()
+    if len(items) < 3:
+        set_status(c, uid, "rejected", "мало постов за неделю")
+        log.info("Итоги недели пропущены: постов %d", len(items))
+        return
+    try:
+        res = generate_digest(models, items)
+        post = str(res.get("post") or "").strip()
+        if res.get("publish") is not True or len(post) < 200:
+            raise ValueError("Gemini не вернул пост итогов")
+        photo, cov = make_cover({**res, "cover_title": "Итоги недели"}, "digest", uid, names, c, now)
+        set_status(c, uid, "sending", post=post)
+        mid = deliver(photo, post[:4000])
+        set_status(c, uid, "published", f"kind=digest;cover={cov};telegram_message_id={mid}")
+        log.info("Опубликованы итоги недели (%d тем)", len(items))
+    except Exception as ex:
+        set_status(c, uid, "error", scrub(ex)[:1000])
+        raise
+
+
+def main():
+    if not TG_TOKEN or not GEMINI_KEY:
+        sys.exit("Не заданы секреты TELEGRAM_BOT_TOKEN и/или GEMINI_API_KEY")
+
+    c = db()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    manual = env("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+    for job in (monthly_report, check_silence):   # служебные уведомления не должны ломать запуск
+        try:
+            job(c, now)
+        except Exception as ex:
+            log.warning("%s: %s", job.__name__, scrub(ex))
+    why = blocked_reason(c, now, manual)
+    if why:
+        log.info("Пропуск: %s", why)
+        return
+
+    key = digest_due(c, now, manual)
+    if key:
+        names = list_models()
+        return run_digest(c, now, key, pick_models(names), names)
+
+    names = list_models()
+    models = pick_models(names)
+    log.info("Модели Gemini: %s", ", ".join(models[:3]))
+
+    published_total = c.execute(
+        "SELECT COUNT(*) FROM articles WHERE status='published' AND url NOT LIKE 'digest:%'"
+    ).fetchone()[0]
+    planned_kind = KINDS[published_total % len(KINDS)]
+    recent = recent_titles(c)
+
+    if planned_kind == "history":
+        if run_history(c, now, models, names, recent):
+            return
+        planned_kind = "news"   # не вышло — публикуем обычную новость
+
+    try:
+        candidates = collect(c, now)
+    except RuntimeError as ex:
+        if not WEB_SCOUT:
+            raise
+        log.warning("RSS недоступны (%s), пробую поиск по интернету", ex)
+        candidates = []
+    if WEB_SCOUT:
+        try:
+            candidates += web_candidates(c, models, now, published_total)
+        except Exception as ex:   # поиск — дополнение, его сбой не должен останавливать RSS
+            log.warning("Поиск по интернету не сработал: %s", scrub(ex))
+    candidates = order(c, candidates, prefer_web=published_total % 2 == 1)
+    if not candidates:
+        log.info("Новых подходящих новостей нет")
+        return
+
+    hook = HOOKS[published_total % len(HOOKS)]
+    openings = [
+        (r[0] or "").strip().split("\n")[0][:80]
+        for r in c.execute(
+            "SELECT post FROM articles WHERE status='published' AND post IS NOT NULL "
+            "ORDER BY created DESC LIMIT 5")
+    ]
+    extra = f"Зачин на этот раз: {hook}."
+    if any(openings):
+        extra += " Не начинай так же, как недавние посты: " + " | ".join(o for o in openings if o) + "."
+
+    deadline = time.time() + RUN_BUDGET_SEC
+    errors = []
+
+    for _, uid, url, title, summary, is_open, topic, prefetched, _web in candidates[:MAX_TRIES_PER_RUN]:
+        if time.time() > deadline:
+            log.warning("Лимит времени запуска исчерпан")
+            break
+
+        c.execute(
+            "INSERT OR IGNORE INTO articles (id,url,title,status,created,attempts) "
+            "VALUES (?,?,?,?,?,0)",
+            (uid, url, title, "processing", now.isoformat()),
+        )
+        c.execute(
+            "UPDATE articles SET status='processing', created=?, topic=?, "
+            "attempts=COALESCE(attempts,0)+1 WHERE id=?", (now.isoformat(), topic, uid),
+        )
+        c.commit()
+
+        try:
+            kind, body = planned_kind, prefetched
+            if kind == "longread":
+                text = prefetched or (fetch_body(url) if (LONGREADS and is_open) else "")
+                if LONGREADS and is_open and len(text) >= 1200:
+                    body = text
+                else:   # не из чего или нельзя писать статью — делаем обычную новость
+                    kind = "news"
+
+            res = generate(models, kind, title, url, summary, body, recent, extra)
+
+            if res.get("publish") is not True:
+                set_status(c, uid, "rejected", str(res.get("reason") or "filtered")[:500])
+                log.info("Отклонено: %s", title)
+                continue
+
+            post = str(res.get("post") or "").strip()
+            if len(post) < 200:
+                raise ValueError("Gemini вернул пустой или слишком короткий пост")
+            post = with_source(post, url)
+
+            article = None
+            if kind == "longread":
+                text = str(res.get("article") or "").strip()
+                if len(text) >= 1200:
+                    article = fit_article(text, url)
+                else:
+                    kind = "news"
+
+            photo, cov = make_cover(res, kind, uid, names, c, now)
+
+            set_status(c, uid, "sending", post=post)
+            mid = deliver(photo, post, article)
+            set_status(c, uid, "published", f"kind={kind};cover={cov};telegram_message_id={mid}")
+            log.info("Опубликовано (%s): %s", kind, title)
+            return  # одна публикация за запуск
+
+        except Exception as ex:
+            msg = scrub(ex)
+            set_status(c, uid, "error", msg[:1000])
+            log.error("Ошибка при обработке «%s»: %s", title, msg)
+            errors.append(f"{title}: {msg}")
+
+    if errors:
+        raise RuntimeError("Ошибки: " + " | ".join(errors[:3]))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as ex:
+        log.error("Сбой запуска: %s", scrub(ex))
+        alert("⚠️ «Завтра ближе»: " + scrub(ex))
+        sys.exit(1)
