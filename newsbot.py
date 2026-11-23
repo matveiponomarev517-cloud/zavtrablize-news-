@@ -131,6 +131,10 @@ def scrub(value):
     return s
 
 
+class Transient(RuntimeError):
+    """Временный сбой сервиса (перегрузка, лимит, сеть): не вина новости, надо повторить позже."""
+
+
 def req(url, data=None, headers=None, retries=2, timeout=40):
     """HTTP-запрос. Ошибки содержат тело ответа (причину), но не URL с токеном."""
     host = urllib.parse.urlsplit(url).netloc
@@ -144,15 +148,17 @@ def req(url, data=None, headers=None, retries=2, timeout=40):
                 return x.read()
         except urllib.error.HTTPError as e:
             body = e.read()[:300].decode("utf-8", "replace")
-            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+            retryable = e.code in (429, 500, 502, 503, 504)
+            if retryable and attempt < retries:
                 time.sleep(5 * (attempt + 1))
                 continue
-            raise RuntimeError(scrub(f"HTTP {e.code} от {host}: {body}")) from None
+            err = Transient if retryable else RuntimeError
+            raise err(scrub(f"HTTP {e.code} от {host}: {body}")) from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             if attempt < retries:
                 time.sleep(5 * (attempt + 1))
                 continue
-            raise RuntimeError(scrub(f"Сеть, {host}: {e}")) from None
+            raise Transient(scrub(f"Сеть, {host}: {e}")) from None
 
 
 # ---------- Telegram ----------
@@ -258,10 +264,14 @@ def pick_models(names):
             raise RuntimeError("Модель GEMINI_MODEL недоступна: " + MODEL_OVERRIDE)
         return [MODEL_OVERRIDE]
     ok = [n for n in names if n.startswith("gemini-") and not any(b in n for b in _BAD)]
-    ordered = []
-    for suffix in ("flash", "flash-lite"):   # для текстов сначала полноценный flash, он пишет живее
-        stable = [n for n in ok if re.fullmatch(rf"gemini-\d+(?:\.\d+)?-{suffix}", n)]
-        ordered += sorted(stable, key=_ver, reverse=True)
+    def stable(suffix):
+        found = [n for n in ok if re.fullmatch(rf"gemini-\d+(?:\.\d+)?-{suffix}", n)]
+        return sorted(found, key=_ver, reverse=True)
+
+    flash, lite = stable("flash"), stable("flash-lite")
+    # Сначала лучший flash (пишет живее), вторым — лучший flash-lite: у него своя ёмкость, и при
+    # перегрузке flash он обычно отвечает. Потом остальные.
+    ordered = flash[:1] + lite[:1] + flash[1:] + lite[1:]
     rest = [n for n in ok if "flash" in n and n not in ordered]
     ordered += sorted(rest, key=lambda n: ("lite" not in n, "preview" in n, n))
     if not ordered:
@@ -290,25 +300,33 @@ def gemini_json(models, prompt):
         },
     }).encode()
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY}
-    last = None
-    for model in models[:3]:
-        try:
-            d = json.loads(req(f"{GEMINI_URL}models/{model}:generateContent", body, headers, timeout=90))
-            cand = (d.get("candidates") or [{}])[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts)
-            if not text:
-                raise RuntimeError(
-                    f"Пустой ответ Gemini: {cand.get('finishReason') or d.get('promptFeedback')}"
-                )
-            res = parse_json(text)
-            if not isinstance(res, dict):
-                raise ValueError("Gemini вернул не объект JSON")
-            return res
-        except (RuntimeError, ValueError) as ex:
-            last = f"{model}: {scrub(ex)}"
-            log.warning("Gemini не сработал (%s)", last)
-    raise RuntimeError("Gemini: " + str(last))
+    errors = []
+    for rnd in range(2):                      # два круга по моделям; между ними пауза
+        if rnd:
+            log.info("Все модели недоступны, жду 25 с и пробую ещё раз")
+            time.sleep(25)
+        for model in models[:5]:
+            try:
+                d = json.loads(req(f"{GEMINI_URL}models/{model}:generateContent", body, headers,
+                                   retries=1, timeout=90))
+                cand = (d.get("candidates") or [{}])[0]
+                parts = (cand.get("content") or {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts)
+                if not text:
+                    raise RuntimeError(
+                        f"Пустой ответ Gemini: {cand.get('finishReason') or d.get('promptFeedback')}"
+                    )
+                res = parse_json(text)
+                if not isinstance(res, dict):
+                    raise ValueError("Gemini вернул не объект JSON")
+                return res
+            except (RuntimeError, ValueError) as ex:
+                errors.append(ex)
+                log.warning("Gemini не сработал (%s: %s)", model, str(scrub(ex))[:160])
+        if not all(isinstance(e, Transient) for e in errors):
+            break                              # были и не временные ошибки — повтор не поможет
+    msg = "Gemini: " + scrub(errors[-1]) if errors else "Gemini: нет моделей"
+    raise (Transient if errors and all(isinstance(e, Transient) for e in errors) else RuntimeError)(msg)
 
 
 HOOKS = [
@@ -466,6 +484,34 @@ def set_status(c, uid, status, error=None, post=None):
     c.commit()
 
 
+def release(c, uid):
+    """Временный сбой сервиса: новость не виновата, попытка не засчитывается."""
+    c.execute(
+        "UPDATE articles SET status='retry', attempts=MAX(COALESCE(attempts,0)-1, 0) WHERE id=?", (uid,)
+    )
+    c.commit()
+
+
+def note_overload(c, now, msg):
+    """Считает подряд неудачные из-за перегрузки запуски; пишет админу только при затяжной проблеме."""
+    streak = bump(c, "overload_streak")
+    log.warning("Сервис перегружен, повторю на следующем запуске (подряд: %d): %s", streak, msg[:200])
+    if streak < 3:
+        return
+    row = c.execute("SELECT v FROM meta WHERE k='overload_alert'").fetchone()
+    if row and now - datetime.datetime.fromisoformat(row[0]) < datetime.timedelta(hours=12):
+        return
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('overload_alert', ?)", (now.isoformat(),))
+    c.commit()
+    alert(f"⚠️ «Завтра ближе»: {streak} запусков подряд сервис Google перегружен или недоступен. "
+          "Это обычно проходит само. Последняя ошибка: " + msg[:400])
+
+
+def clear_overload(c):
+    c.execute("DELETE FROM meta WHERE k='overload_streak'")
+    c.commit()
+
+
 def blocked_reason(c, now, manual):
     """Почему сейчас нельзя публиковать (None = можно). Ручной запуск обходит окно и паузу."""
     day_start = (
@@ -496,6 +542,7 @@ def bump(c, key, n=1):
         "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + ? AS TEXT)", (key, str(n), n)
     )
     c.commit()
+    return int(c.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()[0])
 
 
 def monthly_report(c, now):
@@ -841,6 +888,10 @@ def run_history(c, now, models, names, recent):
         set_status(c, uid, "published", f"kind=history;cover={cov};url={url};telegram_message_id={mid}")
         log.info("Опубликовано (history): %s", events[idx][1][:80])
         return True
+    except Transient as ex:
+        release(c, uid)
+        log.warning("История: сервис недоступен, попытка не засчитана (%s)", scrub(ex)[:160])
+        return False
     except Exception as ex:
         set_status(c, uid, "error", scrub(ex)[:1000])
         log.error("История не опубликована: %s", scrub(ex))
@@ -1026,6 +1077,7 @@ def main():
                     kind = "news"
 
             res = generate(models, kind, title, url, summary, body, recent, extra)
+            clear_overload(c)   # Gemini ответил — перегрузка прошла
 
             if res.get("publish") is not True:
                 set_status(c, uid, "rejected", str(res.get("reason") or "filtered")[:500])
@@ -1053,6 +1105,12 @@ def main():
             log.info("Опубликовано (%s): %s", kind, title)
             return  # одна публикация за запуск
 
+        except Transient as ex:
+            # Перегрузка/лимит/сеть: остальные кандидаты упрутся в то же самое. Не тратим попытки
+            # новостей и время, просто ждём следующего запуска.
+            release(c, uid)
+            note_overload(c, now, scrub(ex))
+            return
         except Exception as ex:
             msg = scrub(ex)
             set_status(c, uid, "error", msg[:1000])
@@ -1068,6 +1126,11 @@ if __name__ == "__main__":
         main()
     except SystemExit:
         raise
+    except Transient as ex:   # временный сбой до начала работы с новостью (список моделей, сеть)
+        try:
+            note_overload(db(), datetime.datetime.now(datetime.timezone.utc), scrub(ex))
+        except Exception as inner:
+            log.error("Не удалось записать сбой: %s", scrub(inner))
     except Exception as ex:
         log.error("Сбой запуска: %s", scrub(ex))
         alert("⚠️ «Завтра ближе»: " + scrub(ex))
