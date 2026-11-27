@@ -36,8 +36,9 @@ def env(name, default=""):
 
 
 DB = env("DB_PATH", "news.db")
-MAX_DAY = int(env("MAX_PER_DAY", "3"))
-MIN_GAP_MIN = int(env("MIN_GAP_MINUTES", "120"))
+SLOTS = sorted({int(x) for x in env("POST_SLOTS", "9,14,19").split(",") if x.strip().isdigit()})
+MAX_DAY = int(env("MAX_PER_DAY", str(max(3, len(SLOTS)))))
+MIN_GAP_MIN = int(env("MIN_GAP_MINUTES", "90"))
 HOUR_FROM = int(env("POST_HOUR_FROM", "8"))    # окно публикаций, МСК
 HOUR_TO = int(env("POST_HOUR_TO", "23"))
 COVERS = env("COVERS", "1") != "0"             # обложки вообще
@@ -526,8 +527,15 @@ def blocked_reason(c, now, manual):
         return f"дневной лимит ({n}/{MAX_DAY})"
     if manual:
         return None
-    if not HOUR_FROM <= now.astimezone(MSK).hour < HOUR_TO:
+    hour = now.astimezone(MSK).hour
+    if not HOUR_FROM <= hour < HOUR_TO:
         return f"вне окна публикаций {HOUR_FROM}-{HOUR_TO} МСК"
+    # Слоты: к 9:00 положен 1 пост за день, к 14:00 — 2, к 19:00 — 3. Если запуск по расписанию
+    # GitHub пропустил, любой следующий запуск «догонит» недостающий пост.
+    allowed = sum(1 for s in SLOTS if hour >= s)
+    if n >= allowed:
+        nxt = next((s for s in SLOTS if s > hour), None)
+        return f"сегодня по плану уже {n} из {allowed}" + (f", следующий слот в {nxt}:00 МСК" if nxt else "")
     last = c.execute("SELECT MAX(created) FROM articles WHERE status='published'").fetchone()[0]
     if last:
         gap = now - datetime.datetime.fromisoformat(last)
@@ -989,6 +997,16 @@ def main():
     c = db()
     now = datetime.datetime.now(datetime.timezone.utc)
     manual = env("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    log.info("Запуск: %s, %s МСК", env("GITHUB_EVENT_NAME") or "локально",
+             now.astimezone(MSK).strftime("%d.%m %H:%M"))
+
+    # Раз в сутки отмечаемся в базе: коммит с базой считается активностью в репозитории,
+    # а без активности GitHub через 60 дней сам отключает запуски по расписанию.
+    today = now.astimezone(MSK).date().isoformat()
+    c.execute("INSERT OR IGNORE INTO meta VALUES ('heartbeat', '')")
+    if c.execute("SELECT v FROM meta WHERE k='heartbeat'").fetchone()[0] != today:
+        c.execute("UPDATE meta SET v=? WHERE k='heartbeat'", (today,))
+        c.commit()
 
     for job in (monthly_report, check_silence):   # служебные уведомления не должны ломать запуск
         try:
